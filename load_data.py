@@ -2,133 +2,309 @@ import numpy as np
 import torch
 import os
 import cv2
-import math
-import datetime
+import h5py
+from unet3d import UNet3D
+from collections import OrderedDict
+from tqdm import tqdm
 
 from scipy.spatial.distance import cdist
 from torch.utils.data import Dataset
 
+
 def arange_like(x, dim: int):
     return x.new_ones(x.shape[dim]).cumsum(0) - 1  # traceable in 1.1
 
-class SparseDataset(Dataset):
-    """Sparse correspondences dataset."""
 
-    def __init__(self, train_path, nfeatures):
+def resume_params(model, path):
+    checkpoint = torch.load(path)
+    new_state_dict = OrderedDict()
+    state_dict = checkpoint['model_weights']
+    for k, v in state_dict.items():
+        name = k[7:]  # remove module.
+        new_state_dict[name] = v
+    model.load_state_dict(new_state_dict)
+    return model
 
-        self.files = []
-        self.files += [train_path +'/'+ f for f in os.listdir(train_path)]
 
-        self.nfeatures = nfeatures
-        # self.sift = cv2.xfeatures2d.SIFT_create(nfeatures=self.nfeatures)
-        self.sift = cv2.SIFT_create(nfeatures=self.nfeatures)
-        self.matcher = cv2.BFMatcher_create(cv2.NORM_L1, crossCheck=False)
+def model_forward(raw, labels, model):
+    sel_raw = (slice(0, 40), slice(0, 625), slice(0, 625))
+    input = raw[sel_raw].astype(np.float32) / 255.0
+    input = np.expand_dims(np.expand_dims(input, axis=0), axis=0)
+    input = torch.Tensor(input).to('cuda').contiguous()
+    # print(input.shape)
+    pred, feature = model(input)
+    # print(pred.shape, feature.shape)  # ([1, 12, 12, 407, 407])
+
+    z_edge = input.shape[-3] - feature.shape[-3]
+    x_edge = input.shape[-2] - feature.shape[-2]
+    y_edge = input.shape[-1] - feature.shape[-1]
+    sel_pred = (slice(z_edge // 2, -z_edge // 2), slice(x_edge // 2, -x_edge // 2), slice(y_edge // 2, -y_edge // 2))
+    labels = labels[sel_raw][sel_pred]
+    raw = raw[sel_raw][sel_pred]
+    # print(labels.shape)
+    assert feature.shape[-3:] == labels.shape  # feature和mask的尺寸应该一致
+
+    return feature, labels, raw
+
+
+def model_multi_forward(raw, labels, model, mode='train'):
+    if mode == 'train':
+        sel_raw = (slice(0, 100), slice(None), slice(None))
+    else:
+        sel_raw = (slice(100, 125), slice(None), slice(None))
+    raw = raw[sel_raw]
+
+    stride = 56
+    in_shape = [84, 268, 268]
+    out_shape = [56, 56, 56]
+    all_feature = torch.zeros([1, 12, raw.shape[0] - (in_shape[0] - out_shape[0]),
+                               raw.shape[1] - (in_shape[1] - out_shape[1]),
+                               raw.shape[2] - (in_shape[2] - out_shape[2])], requires_grad=True)
+
+    part = 0
+    zz = list(np.arange(0, raw.shape[0] - in_shape[0], stride)) + [raw.shape[0] - in_shape[0]]
+    for z in zz:
+        part += 1
+        print('Part %d / %d' % (part, len(zz)))
+        for y in tqdm(list(np.arange(0, raw.shape[1] - in_shape[1], stride)) + [raw.shape[1] - in_shape[1]]):
+            for x in list(np.arange(0, raw.shape[2] - in_shape[2], stride)) + [raw.shape[2] - in_shape[2]]:
+                input = raw[z: z + in_shape[0], y: y + in_shape[1], x: x + in_shape[2]]
+                input = input.astype(np.float32) / 255.0
+                input = np.expand_dims(np.expand_dims(input, axis=0), axis=0)
+                input = torch.Tensor(input).to('cuda')
+                pred, feature = model(input)
+                all_feature[:, :, z: z + out_shape[0], y: y + out_shape[1], x: x + out_shape[2]] = feature
+
+    z_edge = raw.shape[-3] - all_feature.shape[-3]
+    x_edge = raw.shape[-2] - all_feature.shape[-2]
+    y_edge = raw.shape[-1] - all_feature.shape[-1]
+    sel_pred = (slice(z_edge // 2, -z_edge // 2), slice(x_edge // 2, -x_edge // 2), slice(y_edge // 2, -y_edge // 2))
+    labels = labels[sel_raw][sel_pred]
+    raw = raw[sel_pred]
+    # print(labels.shape)
+    assert all_feature.shape[-3:] == labels.shape  # feature和mask的尺寸应该一致
+    print(all_feature.shape, all_feature)
+
+    return all_feature, labels, raw
+
+
+class NeuronDataset(Dataset):
+
+    def __init__(self, data_path, model_path):
+
+        model = UNet3D()
+        model = resume_params(model, model_path)
+        model.cuda()
+
+        with h5py.File(data_path, 'r') as f:
+            raw = f['volumes/raw'][:]
+            labels = f['volumes/labels/neuron_ids'][:]
+
+        self.feature, self.labels, self.raw = model_forward(raw, labels, model)
 
     def __len__(self):
-        return len(self.files)
+        return self.labels.shape[0] - 1
 
     def __getitem__(self, idx):
-        file_name = self.files[idx]
-        image = cv2.imread(file_name, cv2.IMREAD_GRAYSCALE) #读取一张图片
-        sift = self.sift
-        width, height = image.shape[:2]
-        corners = np.array([[0, 0], [0, height], [width, 0], [width, height]], dtype=np.float32)
-        warp = np.random.randint(-224, 224, size=(4, 2)).astype(np.float32)
 
-        # get the corresponding warped image
-        M = cv2.getPerspectiveTransform(corners, corners + warp)
-        warped = cv2.warpPerspective(src=image, M=M, dsize=(image.shape[1], image.shape[0])) # return an image type
-        
-        # extract keypoints of the image pair using SIFT
-        kp1, descs1 = sift.detectAndCompute(image, None)
-        kp2, descs2 = sift.detectAndCompute(warped, None) #分别获取映射变换前后的关键点和描述子
+        '''对第一张图片进行处理'''
+        neuron_ids, id_counts = np.unique(self.labels[idx], return_counts=True)
+        # print(len(neuron_ids))
+        valid_ids_index = id_counts > 1000
+        neuron_ids = neuron_ids[valid_ids_index]  # 有效的neuron_ids
+        # print(len(neuron_ids), id_counts)
 
-        # limit the number of keypoints
-        kp1_num = min(self.nfeatures, len(kp1))
-        kp2_num = min(self.nfeatures, len(kp2))
-        kp1 = kp1[:kp1_num]
-        kp2 = kp2[:kp2_num]
+        # 根据每个mask做gap提取特征向量
+        feature_gap_list = []
+        for i, id in enumerate(neuron_ids):
+            mask = torch.Tensor(self.labels[idx] == id).cuda()
+            feature_slice = self.feature[0, :, idx, :]
+            feature_m = feature_slice * mask
+            # print(feature_m.shape)
+            feature_gap = feature_m.sum(dim=-1).sum(dim=-1) / mask.sum()
 
-        kp1_np = np.array([(kp.pt[0], kp.pt[1]) for kp in kp1])
-        kp2_np = np.array([(kp.pt[0], kp.pt[1]) for kp in kp2])
+            # 将feature拓展到128维, resize方法为简单补0, 可以改为拷贝自身到128维
+            feature_gap_128 = torch.zeros((1, 128), requires_grad=True).cuda()
+            feature_gap_128[0, :12] = feature_gap[:]
+
+            # print(feature_gap.shape, mask.sum())
+            # print(i, id, feature_gap)
+            if i == 0:
+                feature_gap_list = feature_gap_128
+            else:
+                feature_gap_list = torch.cat((feature_gap_list, feature_gap_128), dim=0)
+        # print(feature_gap_list.shape) # torch.Size([30, 128])
+        feature_gap_list = torch.transpose(feature_gap_list, 0, 1)
+        # 原load_data代码使用了转置操作(为什么??),这里也保持一致
+        # print(feature_gap_list.shape)
+
+        # 找出平均坐标
+        coor_list = []
+        for i, id in enumerate(neuron_ids):
+            coor_array = np.where(self.labels[idx] == id)
+            y = np.average(coor_array[1])
+            x = np.average(coor_array[0])
+            coor = np.array([y, x])
+            coor_list.append(coor)
+        coor_list = np.array(coor_list).reshape((1, -1, 2))
+
+        '''对第二张图片进行处理'''
+        neuron_ids2, id_counts2 = np.unique(self.labels[idx + 1], return_counts=True)
+        # print(len(neuron_ids2))
+        valid_ids_index = id_counts2 > 1000
+        neuron_ids2 = neuron_ids2[valid_ids_index]  # 有效的neuron_ids
+        # print(len(neuron_ids2), id_counts2)
+
+        feature_gap_list2 = []
+        for i, id in enumerate(neuron_ids2):
+            mask = torch.Tensor(self.labels[idx + 1] == id).cuda()
+            feature_slice = self.feature[0, :, idx + 1, :]
+            feature_m = feature_slice * mask
+            # print(feature_m.shape)
+            feature_gap = feature_m.sum(dim=-1).sum(dim=-1) / mask.sum()
+
+            # 将feature拓展到128维, resize方法为简单补0, 可以改为拷贝自身到128维
+            feature_gap_128 = torch.zeros((1, 128), requires_grad=True).cuda()
+            feature_gap_128[0, :12] = feature_gap[:]
+
+            if i == 0:
+                feature_gap_list2 = feature_gap_128
+            else:
+                feature_gap_list2 = torch.cat((feature_gap_list2, feature_gap_128), dim=0)
+        feature_gap_list2 = torch.transpose(feature_gap_list2, 0, 1)
+
+        coor_list2 = []
+        for i, id in enumerate(neuron_ids2):
+            coor_array = np.where(self.labels[idx + 1] == id)
+            y = np.average(coor_array[1])
+            x = np.average(coor_array[0])
+            coor = np.array([y, x])
+            coor_list2.append(coor)
+        coor_list2 = np.array(coor_list2).reshape((1, -1, 2))
 
         # skip this image pair if no keypoints detected in image
-        if len(kp1) < 1 or len(kp2) < 1:
-            return{
+        if len(neuron_ids) < 1 or len(neuron_ids2) < 1:
+            return {
                 'keypoints0': torch.zeros([0, 0, 2], dtype=torch.double),
                 'keypoints1': torch.zeros([0, 0, 2], dtype=torch.double),
                 'descriptors0': torch.zeros([0, 2], dtype=torch.double),
                 'descriptors1': torch.zeros([0, 2], dtype=torch.double),
-                'image0': image,
-                'image1': warped,
-                'file_name': file_name
-            } 
+                'image0': self.raw[idx],
+                'image1': self.raw[idx + 1],
+                'file_name': str(idx)
+            }
 
-        # confidence of each key point
-        scores1_np = np.array([kp.response for kp in kp1]) 
-        scores2_np = np.array([kp.response for kp in kp2])
+            # 暂时忽略特征分数,取一个固定值0.05
+        scores = np.array([0.05] * len(neuron_ids))
+        scores2 = np.array([0.05] * len(neuron_ids2))
 
-        kp1_np = kp1_np[:kp1_num, :]
-        kp2_np = kp2_np[:kp2_num, :]
-        descs1 = descs1[:kp1_num, :]
-        descs2 = descs2[:kp2_num, :]
+        '''计算两张图片的匹配矩阵'''
+        # print(len(neuron_ids), len(neuron_ids2))
 
-        # obtain the matching matrix of the image pair
-        matched = self.matcher.match(descs1, descs2)
-        kp1_projected = cv2.perspectiveTransform(kp1_np.reshape((1, -1, 2)), M)[0, :, :] 
-        dists = cdist(kp1_projected, kp2_np)
+        matches = np.intersect1d(neuron_ids, neuron_ids2)
+        match_idx = np.array([np.where(neuron_ids == id)[0][0] for id in matches])
+        match_idx2 = np.array([np.where(neuron_ids2 == id)[0][0] for id in matches])
 
-        min1 = np.argmin(dists, axis=0)
-        min2 = np.argmin(dists, axis=1)
+        max_value = len(neuron_ids)
+        max_value2 = len(neuron_ids2)
 
-        min1v = np.min(dists, axis=1)
-        min1f = min2[min1v < 3]
+        missing = np.setdiff1d(np.arange(max_value), match_idx)  # 返回在ar1中但不在ar2中的已排序的唯一值
+        missing2 = np.setdiff1d(np.arange(max_value2), match_idx2)
 
-        xx = np.where(min2[min1] == np.arange(min1.shape[0]))[0]
-        matches = np.intersect1d(min1f, xx)
-
-        missing1 = np.setdiff1d(np.arange(kp1_np.shape[0]), min1[matches])
-        missing2 = np.setdiff1d(np.arange(kp2_np.shape[0]), matches)
-
-        MN = np.concatenate([min1[matches][np.newaxis, :], matches[np.newaxis, :]])
-        MN2 = np.concatenate([missing1[np.newaxis, :], (len(kp2)) * np.ones((1, len(missing1)), dtype=np.int64)])
-        MN3 = np.concatenate([(len(kp1)) * np.ones((1, len(missing2)), dtype=np.int64), missing2[np.newaxis, :]])
+        MN = np.concatenate([match_idx[np.newaxis, :], match_idx2[np.newaxis, :]])
+        MN2 = np.concatenate([missing[np.newaxis, :], (max_value2) * np.ones((1, len(missing)), dtype=np.int64)])
+        MN3 = np.concatenate([(max_value) * np.ones((1, len(missing2)), dtype=np.int64), missing2[np.newaxis, :]])
         all_matches = np.concatenate([MN, MN2, MN3], axis=1)
 
-        kp1_np = kp1_np.reshape((1, -1, 2))
-        kp2_np = kp2_np.reshape((1, -1, 2))
-        descs1 = np.transpose(descs1 / 256.)
-        descs2 = np.transpose(descs2 / 256.)
-
-        # image = torch.from_numpy(image / 255.).double()[None].cuda()
-        # warped = torch.from_numpy(warped / 255.).double()[None].cuda()
-        image = torch.from_numpy(image / 255.).double()[None]
-        warped = torch.from_numpy(warped / 255.).double()[None]
-
-        return{
-            'keypoints0': list(kp1_np),
-            'keypoints1': list(kp2_np),
-            'descriptors0': list(descs1),
-            'descriptors1': list(descs2),
-            'scores0': list(scores1_np),
-            'scores1': list(scores2_np),
-            'image0': image,
-            'image1': warped,
+        # 这里返回数据为什么要用list呢,tensor转list,再用torch.stack转回来中间会多出一个维度
+        # 如torch.Size([128, 30]) -> torch.Size([128, 1, 30])
+        return {
+            'keypoints0': list(coor_list),
+            'keypoints1': list(coor_list2),
+            'descriptors0': list(feature_gap_list),
+            'descriptors1': list(feature_gap_list2),
+            'scores0': list(scores),
+            'scores1': list(scores2),
+            'image0': torch.from_numpy(self.raw[idx] / 255.).double()[None].cuda(),
+            'image1': torch.from_numpy(self.raw[idx + 1] / 255.).double()[None].cuda(),
             'all_matches': list(all_matches),
-            'file_name': file_name
+            'file_name': str(idx)
         }
 
+
 if __name__ == '__main__':
-    dataset = SparseDataset(train_path='D:/WORKSPACE/Dataset/coco2017/train2017', nfeatures=1024)
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+
+    dataset = NeuronDataset(data_path='/home1/lns/Dataset/sample_A_20160501.hdf',
+                            model_path='/home1/lns/experiment/MALA_pytorch/models_A/model-100000.ckpt')
+
     train_loader = torch.utils.data.DataLoader(dataset=dataset, shuffle=False, batch_size=1,
                                                drop_last=True)
+    input()
     for i, pred in enumerate(train_loader):
-        # print(pred['all_matches'][0].shape,pred['all_matches'][1].shape)
-        print(pred['all_matches'][1] == pred['all_matches'][0])
-        # mutual0 = arange_like(pred['all_matches'][0], 1)[None] == pred['all_matches'][1].gather(1,
-        #                                                                                         pred['all_matches'][0])
-        # mutual1 = arange_like(pred['all_matches'][1], 1)[None] == pred['all_matches'][0].gather(1,
-        #                                                                                         pred['all_matches'][1])
-        # print(mutual0, mutual0)
+        # print(pred['descriptors0'])
+        # print(pred['keypoints0'])
 
+        print(pred['all_matches'][0].shape, pred['all_matches'][1].shape)
+        print(len(pred['all_matches']))
+        print(pred['all_matches'])
 
+        # print(pred['keypoints0'][0].shape, pred['keypoints1'][0].shape)
+        # print(len(pred['descriptors0']), pred['descriptors0'][0].shape)
+        # print(len(pred['descriptors1']), pred['descriptors1'][0].shape)
+        # print(torch.stack(pred['descriptors0']).shape)
+
+        # print(len(pred['scores0']), pred['scores0'])
+        # print(len(pred['scores1']), pred['scores1'])
+
+        # print(torch.transpose(pred['scores0'], 0, 1))
+
+        # if i == 0: break
+
+'''
+torch.Size([1, 30]) torch.Size([1, 30])
+2
+[tensor([[ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+         18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 26]]), 
+         tensor([[ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]])]
+
+[tensor([[[338.7082,  64.9870],
+         [391.7832, 296.6621],
+         [163.4719,  39.4214],
+         [379.5217, 138.9277],
+         [253.0356, 347.0572],
+         [337.6165, 302.5403],
+         [282.8585, 129.5659],
+         [206.6646, 395.7788],
+         [143.8161, 164.5005],
+         [ 43.2697,  48.8551],
+         [ 57.6932, 344.7150],
+         [253.0184, 268.6858],
+         [214.3693, 173.2816],
+         [ 54.7645, 129.4628],
+         [356.3526, 241.2599],
+         [376.0599,  28.0148],
+         [276.5390, 207.0053],
+         [119.5054, 256.1456],
+         [224.4446,   8.8850],
+         [379.5657, 378.6574],
+         [184.8955, 111.4810],
+         [ 21.3318, 386.7715],
+         [106.7556, 382.5505],
+         [355.8814, 357.8001],
+         [ 44.4433, 183.0890],
+         [244.8353,  59.2760],
+         [ 95.1324, 200.5272],
+         [322.5097, 109.4182],
+         [ 30.9012, 252.9603],
+         [306.1788,  12.8178]]], dtype=torch.float64)]
+
+torch.Size([1, 30, 2]) torch.Size([1, 29, 2])
+128 torch.Size([1, 30])
+128 torch.Size([1, 29])
+
+30
+29
+'''
